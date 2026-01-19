@@ -317,13 +317,25 @@ r.POST("/ai/chat", func(c *gin.Context) {
         return
     }
 
+    // ĐỊNH NGHĨA KIẾN THỨC VỀ PINGGO Ở ĐÂY
+    systemInstruction := `Bạn là trợ lý ảo độc quyền của mạng xã hội PingGo. 
+    Hãy sử dụng kiến thức dưới đây để hướng dẫn người dùng:
+    1. Giao diện: PingGo có thanh điều hướng (Navbar) trên cùng, Sidebar trái chứa các lối tắt, Newsfeed ở giữa và Sidebar phải chứa danh sách Người liên hệ.
+    2. Đổi ngôn ngữ: Người dùng cần vào Sidebar trái -> Chọn 'Cài đặt & quyền riêng tư' -> Chọn mục 'Ngôn ngữ' -> Chọn các quốc gia như Việt Nam, Mỹ, Trung Quốc, v.v.
+    3. Đăng bài: Sử dụng khung 'NguyễnHoàngHải ơi, bạn đang nghĩ gì thế?' ở đầu trang chủ để chia sẻ trạng thái, ảnh hoặc video.
+    4. Tìm kiếm: PingGo có tìm kiếm thông minh bằng AI. Người dùng gõ từ khóa vào ô tìm kiếm, AI sẽ tự động mở rộng từ khóa để tìm kết quả chính xác hơn.
+    5. Tương tác: Có thể Thích (Like), Bình luận (Comment) và xem danh sách người đã tương tác bằng cách nhấn vào biểu tượng trái tim.
+    6. Tính năng khác: Có menu 3 chấm để Ẩn bài viết, Chặn người dùng hoặc Quan tâm (Interest) một ai đó.
+    7. Kết nối: Có link dẫn sang app nhắn tin PingMe ở Sidebar trái.
+    Luôn trả lời thân thiện, xưng hô là 'PingGo Assistant' và gọi người dùng là 'Hải' hoặc 'bạn'.`
+
     apiKey := os.Getenv("GROQ_API_KEY")
     url := "https://api.groq.com/openai/v1/chat/completions"
 
     payload := map[string]interface{}{
         "model": "llama-3.1-8b-instant",
         "messages": []map[string]string{
-            {"role": "system", "content": "Bạn là trợ lý ảo thông minh của mạng xã hội PingGo. Hãy trả lời ngắn gọn, lịch sự bằng tiếng Việt."},
+            {"role": "system", "content": systemInstruction}, // Nạp kiến thức vào đây
             {"role": "user", "content": req.Message},
         },
     }
