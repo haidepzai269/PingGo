@@ -27,6 +27,11 @@ type GroqResponse struct {
 	} `json:"choices"`
 }
 
+// Thêm struct cho yêu cầu chat
+type ChatRequest struct {
+	Message string `json:"message"`
+}
+
 type RankedPost struct {
     ID    string                 `json:"id"`
     Data  map[string]interface{} `json:"data"`
@@ -34,11 +39,16 @@ type RankedPost struct {
 }
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-        c.Writer.Header().Set("Access-Control-Allow-Origin", "https://chat-145af.web.app")// Chỉ cho phép cổng React của bạn
+		// Lấy origin thực tế từ trình duyệt (localhost hoặc domain web)
+		origin := c.Request.Header.Get("Origin")
+		
+		// Thiết lập các header cho phép
+		c.Writer.Header().Set("Access-Control-Allow-Origin", origin) 
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 
+		// Xử lý Preflight Request (OPTIONS) - Rất quan trọng cho POST request
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -298,6 +308,49 @@ r.GET("/posts/search", func(c *gin.Context) {
         "results":     results,
     })
 })
+
+// Trong hàm main(), thêm Route này:
+r.POST("/ai/chat", func(c *gin.Context) {
+    var req ChatRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu không hợp lệ"})
+        return
+    }
+
+    apiKey := os.Getenv("GROQ_API_KEY")
+    url := "https://api.groq.com/openai/v1/chat/completions"
+
+    payload := map[string]interface{}{
+        "model": "llama-3.1-8b-instant",
+        "messages": []map[string]string{
+            {"role": "system", "content": "Bạn là trợ lý ảo thông minh của mạng xã hội PingGo. Hãy trả lời ngắn gọn, lịch sự bằng tiếng Việt."},
+            {"role": "user", "content": req.Message},
+        },
+    }
+
+    jsonData, _ := json.Marshal(payload)
+    request, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+    request.Header.Set("Authorization", "Bearer "+apiKey)
+    request.Header.Set("Content-Type", "application/json")
+
+    client := &http.Client{Timeout: 20 * time.Second}
+    resp, err := client.Do(request)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Lỗi kết nối AI"})
+        return
+    }
+    defer resp.Body.Close()
+
+    var groqResp GroqResponse
+    json.NewDecoder(resp.Body).Decode(&groqResp)
+
+    if len(groqResp.Choices) > 0 {
+        c.JSON(http.StatusOK, gin.H{"reply": groqResp.Choices[0].Message.Content})
+    } else {
+        c.JSON(http.StatusOK, gin.H{"reply": "Xin lỗi, AI đang bận xử lý, thử lại sau nhé!"})
+    }
+})
+
 	// Sửa r.Run(":8080") thành:
 port := os.Getenv("PORT")
 if port == "" {
@@ -358,3 +411,6 @@ func expandQueryWithGroq(query string) []string {
 
 	return []string{}
 }
+
+
+
