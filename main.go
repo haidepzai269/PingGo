@@ -415,36 +415,64 @@ if port == "" {
 r.Run(":" + port)
 }
 
-// AnalysisWorker - Hộp A tối ưu
+// main.go - Nâng cấp AnalysisWorker với tính năng Auto-Ban
 func AnalysisWorker(client *firestore.Client) {
-	ticker := time.NewTicker(15 * time.Second) 
+	ticker := time.NewTicker(15 * time.Second) // Quét định kỳ 15 giây
 	for range ticker.C {
 		ctx := context.Background()
-		window := time.Now().Add(-5 * time.Minute) // Quét trong 5 phút gần nhất
+		window := time.Now().Add(-5 * time.Minute) // Chỉ quét log trong 5 phút gần nhất
 
+		// Bước 1: Lấy các log mới nhất (Chỉ lọc theo thời gian để tránh lỗi Range Filter)
 		iter := client.Collection("security_logs").
-			Where("path", "==", "/login").
-			Where("status", "!=", 200).
 			Where("createdAt", ">", window).
 			Documents(ctx)
 
 		ipCount := make(map[string]int)
+		
 		for {
 			docSnap, err := iter.Next()
 			if err == iterator.Done { break }
 			if err != nil { break }
-			ip := docSnap.Data()["ip"].(string)
-			ipCount[ip]++
 			
-			if ipCount[ip] >= 10 {
-				// Cập nhật cảnh báo: Dùng Set với MergeAll để không tạo bản ghi trùng lặp
-				client.Collection("security_alerts").Doc(ip).Set(ctx, map[string]interface{}{
-					"ip":        ip,
-					"type":      "Brute-force Attack",
-					"count":     ipCount[ip],
-					"status":    "pending",
-					"updatedAt": firestore.ServerTimestamp,
-				}, firestore.MergeAll)
+			data := docSnap.Data()
+			status, _ := data["status"].(int64)
+			ip, _ := data["ip"].(string)
+
+			// Bước 2: Chỉ đếm các request có lỗi (Status >= 400)
+			if status >= 400 {
+				ipCount[ip]++
+				
+				count := ipCount[ip]
+
+				// NGƯỠNG 1: HIỆN CẢNH BÁO (10 lần)
+				if count >= 3 && count < 10  {
+					client.Collection("security_alerts").Doc(ip).Set(ctx, map[string]interface{}{
+						"ip":        ip,
+						"type":      "Brute-force Attempt",
+						"count":     count,
+						"status":    "pending",
+						"updatedAt": firestore.ServerTimestamp,
+					}, firestore.MergeAll)
+				}
+
+				// NGƯỠNG 2: TỰ ĐỘNG CHẶN (20 lần)
+				if count >= 10{
+					// 1. Đẩy vào Blacklist
+					client.Collection("blacklist").Doc(ip).Set(ctx, map[string]interface{}{
+						"ip":        ip,
+						"reason":    "Auto-blocked: Excessive security violations",
+						"blockedAt": firestore.ServerTimestamp,
+					})
+
+					// 2. Cập nhật trạng thái cảnh báo sang 'blocked' để Admin biết
+					client.Collection("security_alerts").Doc(ip).Update(ctx, []firestore.Update{
+						{Path: "status", Value: "blocked"},
+						{Path: "count", Value: count},
+						{Path: "updatedAt", Value: firestore.ServerTimestamp},
+					})
+					
+					log.Printf("🛡️  SYSTEM: IP %s has been AUTO-BLOCKED after %d violations.", ip, count)
+				}
 			}
 		}
 	}
