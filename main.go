@@ -16,6 +16,7 @@ import (
 	"github.com/cloudinary/cloudinary-go/v2"
 	"github.com/cloudinary/cloudinary-go/v2/api/uploader"
 	"github.com/gin-gonic/gin"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
@@ -58,6 +59,45 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
+// main.go - Middleware nâng cấp
+func SecurityShieldMiddleware(client *firestore.Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method == "OPTIONS" { c.Next(); return }
+
+		start := time.Now()
+		ip := c.ClientIP()
+		path := c.Request.URL.Path
+		ua := c.Request.UserAgent()
+
+		// 1. Kiểm tra Blacklist (Hộp R thực thi)
+		_, err := client.Collection("blacklist").Doc(ip).Get(c)
+		isBlocked := (err == nil)
+
+		if isBlocked {
+			// VẪN GHI LOG (Hộp D) nhưng status là 403 để theo dõi kẻ tấn công
+			go saveSecurityLog(client, ip, path, 403, ua, time.Since(start).Milliseconds())
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Hệ thống SOC đã chặn truy cập từ IP này!"})
+			return
+		}
+
+		c.Next()
+
+		// Ghi log cho request bình thường
+		go saveSecurityLog(client, ip, path, c.Writer.Status(), ua, time.Since(start).Milliseconds())
+	}
+}
+
+// Hàm bổ trợ để Hộp C & D chạy ngầm (không làm chậm App)
+func saveSecurityLog(client *firestore.Client, ip string, path string, status int, ua string, latency int64) {
+	_, _, _ = client.Collection("security_logs").Add(context.Background(), map[string]interface{}{
+		"ip":        ip,
+		"path":      path,
+		"status":    status,
+		"latency":   latency,
+		"userAgent": ua,
+		"createdAt": firestore.ServerTimestamp,
+	})
+}
 
 func main() {
     cld, _ := cloudinary.NewFromURL(os.Getenv("CLOUDINARY_URL"))
@@ -86,7 +126,9 @@ func main() {
 
 
 	r.Use(CORSMiddleware())
-
+    r.Use(SecurityShieldMiddleware(client))
+    // Kích hoạt Hộp A & K chạy ngầm (Analysis Engine)
+    go AnalysisWorker(client)
 	r.POST("/upload", func(c *gin.Context) {
         file, _, err := c.Request.FormFile("file")
         if err != nil {
@@ -363,6 +405,8 @@ r.POST("/ai/chat", func(c *gin.Context) {
     }
 })
 
+
+
 	// Sửa r.Run(":8080") thành:
 port := os.Getenv("PORT")
 if port == "" {
@@ -371,6 +415,40 @@ if port == "" {
 r.Run(":" + port)
 }
 
+// AnalysisWorker - Hộp A tối ưu
+func AnalysisWorker(client *firestore.Client) {
+	ticker := time.NewTicker(15 * time.Second) 
+	for range ticker.C {
+		ctx := context.Background()
+		window := time.Now().Add(-5 * time.Minute) // Quét trong 5 phút gần nhất
+
+		iter := client.Collection("security_logs").
+			Where("path", "==", "/login").
+			Where("status", "!=", 200).
+			Where("createdAt", ">", window).
+			Documents(ctx)
+
+		ipCount := make(map[string]int)
+		for {
+			docSnap, err := iter.Next()
+			if err == iterator.Done { break }
+			if err != nil { break }
+			ip := docSnap.Data()["ip"].(string)
+			ipCount[ip]++
+			
+			if ipCount[ip] >= 10 {
+				// Cập nhật cảnh báo: Dùng Set với MergeAll để không tạo bản ghi trùng lặp
+				client.Collection("security_alerts").Doc(ip).Set(ctx, map[string]interface{}{
+					"ip":        ip,
+					"type":      "Brute-force Attack",
+					"count":     ipCount[ip],
+					"status":    "pending",
+					"updatedAt": firestore.ServerTimestamp,
+				}, firestore.MergeAll)
+			}
+		}
+	}
+}
 func expandQueryWithGroq(query string) []string {
 	apiKey := os.Getenv("GROQ_API_KEY") // Thay Key của bạn vào đây
 	url := "https://api.groq.com/openai/v1/chat/completions"
