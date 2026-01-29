@@ -28,6 +28,12 @@ type GroqResponse struct {
 	} `json:"choices"`
 }
 
+// Thêm struct để nhận dữ liệu nhóm
+type GroupData struct {
+	ID   string                 `json:"id"`
+	Data map[string]interface{} `json:"data"`
+}
+
 // Thêm struct cho yêu cầu chat
 type ChatRequest struct {
 	Message string `json:"message"`
@@ -38,18 +44,19 @@ type RankedPost struct {
     Data  map[string]interface{} `json:"data"`
     Score int                    `json:"score"`
 }
+// main.go
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Lấy origin thực tế từ trình duyệt (localhost hoặc domain web)
 		origin := c.Request.Header.Get("Origin")
 		
-		// Thiết lập các header cho phép
 		c.Writer.Header().Set("Access-Control-Allow-Origin", origin) 
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+
+		// SỬA DÒNG NÀY: Thêm X-User-UID vào danh sách cho phép
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, X-User-UID")
+		
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 
-		// Xử lý Preflight Request (OPTIONS) - Rất quan trọng cho POST request
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -59,7 +66,7 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
-// main.go - Middleware nâng cấp
+// main.go - Cập nhật lại SecurityShieldMiddleware
 func SecurityShieldMiddleware(client *firestore.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Method == "OPTIONS" { c.Next(); return }
@@ -68,28 +75,28 @@ func SecurityShieldMiddleware(client *firestore.Client) gin.HandlerFunc {
 		ip := c.ClientIP()
 		path := c.Request.URL.Path
 		ua := c.Request.UserAgent()
+		
+		// 1. Lấy UID lên đầu tiên để dùng cho các bước sau
+		uid := c.GetHeader("X-User-UID") 
 
-		// 1. Kiểm tra Blacklist (Hộp R thực thi)
-		_, err := client.Collection("blacklist").Doc(ip).Get(c)
-		isBlocked := (err == nil)
-
-		if isBlocked {
-			// VẪN GHI LOG (Hộp D) nhưng status là 403 để theo dõi kẻ tấn công
-			go saveSecurityLog(client, ip, path, 403, ua, time.Since(start).Milliseconds())
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Hệ thống SOC đã chặn truy cập từ IP này!"})
+        _, err := client.Collection("blacklist").Doc(ip).Get(c)
+		if err == nil {
+			// TRUYỀN uid VÀO ĐÂY để ghi log kẻ tấn công
+			go saveSecurityLog(client, uid, ip, path, 403, ua, time.Since(start).Milliseconds())
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "SOC Blocked!"})
 			return
 		}
-
 		c.Next()
 
-		// Ghi log cho request bình thường
-		go saveSecurityLog(client, ip, path, c.Writer.Status(), ua, time.Since(start).Milliseconds())
+		// 3. Ghi log cho request bình thường (Đảm bảo uid được truyền vào)
+		go saveSecurityLog(client, uid, ip, path, c.Writer.Status(), ua, time.Since(start).Milliseconds())
 	}
 }
 
 // Hàm bổ trợ để Hộp C & D chạy ngầm (không làm chậm App)
-func saveSecurityLog(client *firestore.Client, ip string, path string, status int, ua string, latency int64) {
+func saveSecurityLog(client *firestore.Client, uid string, ip string, path string, status int, ua string, latency int64) {
 	_, _, _ = client.Collection("security_logs").Add(context.Background(), map[string]interface{}{
+        "uid":       uid,
 		"ip":        ip,
 		"path":      path,
 		"status":    status,
@@ -127,6 +134,92 @@ func main() {
 
 	r.Use(CORSMiddleware())
     r.Use(SecurityShieldMiddleware(client))
+
+    // ĐĂNG KÝ ROUTE TẠI ĐÂY (Trước dòng r.Run)
+    r.GET("/groups/discover", func(c *gin.Context) {
+        uid := c.Query("uid")
+        if uid == "" {
+            c.JSON(http.StatusBadRequest, gin.H{"error": "Thiếu UID"})
+            return
+        }
+
+        ctx := context.Background() // Đảm bảo có ctx
+
+        // BƯỚC 1: Lấy danh sách tên các nhóm mà Hải đã tham gia
+        myGroupsSnap, err := client.Collection("groups").Where("members", "array-contains", uid).Documents(ctx).GetAll()
+        if err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": "Lỗi truy vấn nhóm của tôi"})
+            return
+        }
+
+        var myGroupNames []string
+        for _, doc := range myGroupsSnap {
+            if name, ok := doc.Data()["name"].(string); ok {
+                myGroupNames = append(myGroupNames, name)
+            }
+        }
+
+        // BƯỚC 2: Dùng AI phân tích sở thích (Keywords)
+        interests := "chung"
+        if len(myGroupNames) > 0 {
+            interests = analyzeInterestsWithGroq(myGroupNames)
+        }
+
+        // BƯỚC 3: Lấy tất cả nhóm Công khai (Public)
+        allPublicGroupsSnap, err := client.Collection("groups").Where("privacy", "==", "public").Documents(ctx).GetAll()
+        if err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": "Lỗi truy vấn nhóm công khai"})
+            return
+        }
+        
+        var suggestions []GroupData
+        for _, doc := range allPublicGroupsSnap {
+            data := doc.Data()
+            membersArr, _ := data["members"].([]interface{})
+            
+            // Kiểm tra nếu Hải chưa có trong nhóm này
+            isMember := false
+            for _, m := range membersArr {
+                if m.(string) == uid {
+                    isMember = true
+                    break
+                }
+            }
+
+            if !isMember {
+                name := strings.ToLower(data["name"].(string))
+                // AI Logic: Nếu tên nhóm chứa từ khóa AI hoặc AI trả về "chung"
+                if interests == "chung" || strings.Contains(name, strings.ToLower(interests)) {
+                    suggestions = append(suggestions, GroupData{ID: doc.Ref.ID, Data: data})
+                }
+            }
+        }
+
+        if len(suggestions) == 0 {
+            count := 0
+            for _, doc := range allPublicGroupsSnap {
+                if count >= 5 { break }
+                data := doc.Data()
+                membersArr, _ := data["members"].([]interface{})
+                
+                isMember := false
+                for _, m := range membersArr {
+                    if m.(string) == uid { isMember = true; break }
+                }
+        
+                if !isMember {
+                    suggestions = append(suggestions, GroupData{ID: doc.Ref.ID, Data: data})
+                    count++
+                }
+            }
+        }
+
+        // Trả về kết quả
+        c.JSON(http.StatusOK, gin.H{
+            "ai_analysis": interests,
+            "results":     suggestions,
+        })
+    })
     // Kích hoạt Hộp A & K chạy ngầm (Analysis Engine)
     go AnalysisWorker(client)
 	r.POST("/upload", func(c *gin.Context) {
@@ -158,6 +251,15 @@ func main() {
 			"message": "Backend PingGo đang chạy!",
 		})
 	})
+
+    // main.go - Thêm vào trong hàm main()
+r.GET("/auth/login-success", func(c *gin.Context) {
+    c.JSON(http.StatusOK, gin.H{"message": "Login event captured"})
+})
+
+r.GET("/auth/logout-success", func(c *gin.Context) {
+    c.JSON(http.StatusOK, gin.H{"message": "Logout event captured"})
+})
 
 	// API lấy danh sách bài viết (Placeholder)
 	r.GET("/posts", func(c *gin.Context) {
@@ -406,7 +508,6 @@ r.POST("/ai/chat", func(c *gin.Context) {
 })
 
 
-
 	// Sửa r.Run(":8080") thành:
 port := os.Getenv("PORT")
 if port == "" {
@@ -530,5 +631,31 @@ func expandQueryWithGroq(query string) []string {
 	return []string{}
 }
 
+// 2. Hàm AI phân tích sở thích
+func analyzeInterestsWithGroq(groupNames []string) string {
+apiKey := os.Getenv("GROQ_API_KEY")
+	url := "https://api.groq.com/openai/v1/chat/completions"
 
+	prompt := "Dựa trên danh sách các nhóm sau: '" + strings.Join(groupNames, ", ") + "'. Hãy đưa ra 1 chủ đề chính ngắn gọn (1-2 từ) mô tả sở thích của người này (VD: Công nghệ, Bóng đá, Học tập). Chỉ trả về đúng từ đó."
 
+	payload := map[string]interface{}{
+		"model": "llama-3.1-8b-instant",
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+	}
+
+	jsonData, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil { return "chung" }
+	defer resp.Body.Close()
+
+	var groqResp GroqResponse
+	json.NewDecoder(resp.Body).Decode(&groqResp)
+	if len(groqResp.Choices) > 0 {
+		return strings.TrimSpace(groqResp.Choices[0].Message.Content)
+	}
+	return "chung"
+}
