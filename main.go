@@ -44,6 +44,15 @@ type RankedPost struct {
     Data  map[string]interface{} `json:"data"`
     Score int                    `json:"score"`
 }
+type InviteRequest struct {
+	SenderID   string   `json:"senderId"`
+	SenderName string   `json:"senderName"`
+	Avatar     string   `json:"avatar"`
+	GroupID    string   `json:"groupId"`
+	GroupName  string   `json:"groupName"`
+	FriendIDs  []string `json:"friendIds"` // Danh sách UID bạn bè được chọn
+}
+
 // main.go
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -507,7 +516,49 @@ r.POST("/ai/chat", func(c *gin.Context) {
     }
 })
 
+// 2. THÊM ROUTE NÀY VÀO TRƯỚC r.Run
+r.POST("/groups/invite", func(c *gin.Context) {
+    var req InviteRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu không hợp lệ"})
+        return
+    }
 
+    // Tạo object lời mời
+    inviteData := map[string]interface{}{
+        "type":       "GROUP_INVITE",
+        "groupId":    req.GroupID,
+        "groupName":  req.GroupName,
+        "senderId":   req.SenderID,
+        "senderName": req.SenderName,
+        "avatar":     req.Avatar,
+        "timestamp":  time.Now().UnixMilli(), // Go lấy time milliseconds
+    }
+
+    ctx := context.Background()
+    successCount := 0
+
+    // Duyệt qua danh sách bạn bè và update Firestore của từng người
+    for _, friendID := range req.FriendIDs {
+        _, err := client.Collection("users").Doc(friendID).Update(ctx, []firestore.Update{
+            {
+                Path:  "groupInvites",
+                Value: firestore.ArrayUnion(inviteData),
+            },
+        })
+        
+        if err == nil {
+            successCount++
+        } else {
+            log.Printf("Lỗi gửi mời cho %s: %v", friendID, err)
+        }
+    }
+
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Đã gửi lời mời thành công",
+        "count":   successCount,
+    })
+})
 	// Sửa r.Run(":8080") thành:
 port := os.Getenv("PORT")
 if port == "" {
